@@ -10,7 +10,10 @@ describe('loads the app UI correctly', () => {
     cy.log(`App is up and running at ${Cypress.config('baseUrl')}`);
   })
 
-  cy.wait(3000);
+  // waiting app to load or it will fail
+  it('give app some time to load', ()=>{
+    cy.wait(3000);
+  })
   
   //check if header component exists
   it('check app #header exists', () => {
