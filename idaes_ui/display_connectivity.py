@@ -22,17 +22,16 @@ that has embedded Mermaid, which can be rendered natively by GitHub.
 
 Run this script with the "-h/--help" option for help on usage.
 """
-
 import argparse
 import csv
 from dataclasses import dataclass, field
 from io import StringIO
-
+import sys
 
 @dataclass
 class MermaidData:
     units: list = field(default_factory=list)
-    stream: dict = field(default_factory=dict)
+    streams: dict = field(default_factory=dict)
     connections: list = field(default_factory=list)
     show_streams: list = field(default_factory=list)
     indent: str = "    "
@@ -79,16 +78,39 @@ class MermaidData:
         for s in self.connections:
             outfile.write(f"{i}{s}\n")
 
-
-class Connectivity:
+class Builder:
     def __init__(self, input_file):
-        datafile = open(input_file, "r")
         self._input_file = input_file
+
+    def build(self):
+        pass
+
+    def get_default_filename(self, ext) -> str:
+        pass
+    
+class ConnectivityFileBuilder(Builder):
+    """Build connectivity information from a file.
+    """
+    def __init__(self, input_file):
+        super().__init__(input_file)
+        datafile = open(input_file, "r")
         reader = csv.reader(datafile)
         self._header = next(reader)
         self._rows = list(reader)
-        self.mermaid = MermaidData()
-        self._build()
+        self._units = None
+        self._streams = None
+
+    def build(self) -> MermaidData:
+        mdata = MermaidData()
+        self._units, mdata.units = self._build_units()
+        self._streams, mdata.streams = self._build_streams()
+        mdata.connections, mdata.show_streams = self._build_connections(
+            self._build_connection_data()
+        )
+        return mdata
+
+    def get_default_filename(self, ext) -> str:
+        return self._change_ext(self._input_file, ext)
 
     @staticmethod
     def _change_ext(fname, ext):
@@ -98,46 +120,6 @@ class Connectivity:
         else:
             filename = fname + ext
         return filename
-
-    @staticmethod
-    def _as_string(fn) -> str:
-        sio = StringIO()
-        fn(sio)
-        return sio.getvalue()
-
-    def as_html(self, filename=None) -> None:
-        if filename is None:
-            filename = self._change_ext(self._input_file, ".html")
-        with open(filename, "w") as outfile:
-            self.mermaid.as_html(outfile)
-
-    def as_html_string(self) -> str:
-        return self._as_string(self.mermaid.as_html)
-
-    def as_markdown(self, filename=None) -> None:
-        if filename is None:
-            filename = self._change_ext(self._input_file, ".md")
-        with open(filename, "w") as outfile:
-            self.mermaid.as_markdown(outfile)
-
-    def as_markdown_string(self) -> str:
-        return self._as_string(self.mermaid.as_markdown)
-
-    def as_mermaid(self, filename=None) -> None:
-        if filename is None:
-            filename = self._change_ext(self._input_file, ".mmd")
-        with open(filename, "w") as outfile:
-            self.mermaid.as_mermaid(outfile)
-
-    def as_mermaid_string(self) -> str:
-        return self._as_string(self.mermaid.as_mermaid)
-
-    def _build(self):
-        self.units, self.mermaid.units = self._build_units()
-        self.streams, self.mermaid.streams = self._build_streams()
-        self.mermaid.connections, self.mermaid.show_streams = self._build_connections(
-            self._build_connection_data()
-        )
 
     def _build_units(self):
         units = {}
@@ -171,7 +153,7 @@ class Connectivity:
         return streams, mermaid_streams
 
     def _build_connection_data(self):
-        connection_data = {s: [None, None] for s in self.streams.values()}
+        connection_data = {s: [None, None] for s in self._streams.values()}
         for row in self._rows[1:]:
             stream_name = row[0]
             col = 1
@@ -179,8 +161,8 @@ class Connectivity:
                 if conn not in ("", "0"):
                     conn = max(0, int(conn))  # -1 -> 0, 1 -> 1
                     unit_name = self._header[col]
-                    unit_abbr = self.units[unit_name]
-                    stream_abbr = self.streams[stream_name]
+                    unit_abbr = self._units[unit_name]
+                    stream_abbr = self._streams[stream_name]
                     # print(f"{stream_name} {stream_abbr} : {conn}")
                     connection_data[stream_abbr][conn] = unit_abbr
                 col += 1
@@ -201,10 +183,110 @@ class Connectivity:
         return connections, show_streams
 
 
+class ModelBuilder(Builder):
+    """Build connectivity information from a model.
+    """
+    def __init__(self, model):
+        self._model = model
+
+    def build(self) -> MermaidData:
+        raise NotImplementedError("Building from a model is not yet supported")
+    
+    # def _identify_arcs(self):
+    #     # Identify the arcs and known endpoints and store them
+    #     for component in self.flowsheet.component_objects(Arc, descend_into=False):
+    #         self.streams[component.getname()] = component
+    #         self._known_endpoints.add(component.source.parent_block())
+    #         self._known_endpoints.add(component.dest.parent_block())
+    #         self._ordered_stream_names.append(component.getname())
+
+    # def _identify_unit_models(self) -> dict:
+    #     # pylint: disable=import-outside-toplevel
+    #     from idaes.core import UnitModelBlockData  # avoid circular import
+    #     from idaes.core.base.property_base import PhysicalParameterBlock, StateBlock
+
+    #     # Create a map of components to their unit type
+    #     components = {}
+
+    #     # Identify the unit models and ports and store them
+    #     for component in self.flowsheet.component_objects(Block, descend_into=True):
+    #         if isinstance(component, UnitModelBlockData):
+    #             # List of components is the same as the provided one
+    #             components[component] = self.get_unit_model_type(component)
+    #         elif isinstance(component, PhysicalParameterBlock) or isinstance(
+    #             component, StateBlock
+    #         ):
+    #             # skip physical parameter / state blocks
+    #             pass
+    #         else:
+    #             # Find unit models nested within indexed blocks
+    #             type_ = self.get_unit_model_type(component)
+    #             for item in component.parent_component().values():
+    #                 if isinstance(item, UnitModelBlockData):
+    #                     # See if this unit is connected to an arc
+    #                     is_connected = False
+    #                     for stream in self.streams.values():
+    #                         if (
+    #                             item == stream.source.parent_block()
+    #                             or item == stream.dest.parent_block()
+    #                         ):
+    #                             is_connected = True
+    #                             break
+    #                     # Add to diagram if connected
+    #                     if is_connected:
+    #                         components[item] = type_
+
+    #     return components
+
+class MermaidOutput:
+    """Output a diagram in the format understood by MermaidJS
+    """
+    def __init__(self, builder: Builder):
+        self.mermaid = builder.build()
+        self._builder = builder
+
+    @staticmethod
+    def _as_string(fn) -> str:
+        sio = StringIO()
+        fn(sio)
+        return sio.getvalue()
+
+    def as_html(self, filename=None) -> None:
+        if filename is None:
+            filename = self._builder.get_default_filename(".html")
+        with open(filename, "w") as outfile:
+            self.mermaid.as_html(outfile)
+
+    def as_html_string(self) -> str:
+        return self._as_string(self.mermaid.as_html)
+
+    def as_markdown(self, filename=None) -> None:
+        if filename is None:
+            filename = self._builder.get_default_filename(".md")
+        with open(filename, "w") as outfile:
+            self.mermaid.as_markdown(outfile)
+
+    def as_markdown_string(self) -> str:
+        return self._as_string(self.mermaid.as_markdown)
+
+    def as_mermaid(self, filename=None) -> None:
+        if filename is None:
+            filename = self._builder.get_default_filename(".mmd")
+        with open(filename, "w") as outfile:
+            self.mermaid.as_mermaid(outfile)
+
+    def as_mermaid_string(self) -> str:
+        return self._as_string(self.mermaid.as_mermaid)
+
+
+def get_model(module_name):
+    return None
+    
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("filename", help="Input filename (CSV file)")
-    p.add_argument("-f", "--format", help="Format",
+    p.add_argument("--csv", help="Input CSV file", default=None)
+    p.add_argument("-M", "--module", help="Input model's Python module", default=None)
+    p.add_argument("--to", help="Packaging format for output mermaid graph",
                    choices=("markdown", "mermaid", "html"), default="html")
     p.add_argument(
         "--ofile",
@@ -213,16 +295,39 @@ if __name__ == "__main__":
     )
     args = p.parse_args()
 
-    try:
-        conn = Connectivity(args.filename)
+    # Sanity-check args
+    if args.csv is None and args.module is None:
+        p.error("Must specify one of --csv or -M/--module as input")
+    elif all((args.csv, args.module)):
+        p.error("Cannot specify more than one input method")
+
+    # Initialize builder
+    if args.csv is not None:
+        builder = ConnectivityFileBuilder(args.csv)
+    elif args.module is not None:
+        try:
+            model = get_model(args.module)
+        except Exception as err:
+            print("ERROR! Could not load model: {err}")
+            sys.exit(1)
+        builder = ModelBuilder(model)
+    else:
+        raise RuntimeError("No input method")
+
+    # Build connectivity information
+    try:        
+        mermaid_out = builder.build()
     except Exception as err:
         print("ERROR! Could not parse connectivity information: {err}")
         print("Printing full stack trace below:")
         raise
 
-    # call method name matching desired output format
-    method_name = f"as_{args.format}"
+    # Create output.
+    # Construct method name matching desired output format
+    # and call the method.
+    method_name = f"as_{args.to}"
     if args.ofile == "-":
-        print(getattr(conn, method_name + "_string")())
+        print(getattr(mermaid_out, method_name + "_string")())
     else:
-        getattr(conn, method_name)(filename=args.ofile)
+        with open(args.ofile, "w") as output_file:
+            getattr(mermaid_out, method_name)(output_file)
