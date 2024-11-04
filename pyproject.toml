@@ -8,14 +8,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
     name = "idaes-ui"
-    description = "IDAES PSE Platform UI"
+    description = "IDAES UI"
     readme = "README.md"
-    version = "0.23.8" #Version format 0.YY.MM
+    version = "0.24.9.dev0" #Version format 0.YY.M
     license = {text="BSD"}
-    requires-python = ">=3.8"
+    requires-python = ">=3.9"
     authors = [
-        {name="The IDAES Project"},
-        {name="Dan Gunter", email="dkgunter@lbl.gov"}
+        {name="The IDAES Project"}
     ]
     classifiers = [
             "Development Status :: 3 - Alpha",
@@ -28,30 +27,40 @@ build-backend = "setuptools.build_meta"
             "Operating System :: Unix",
             "Programming Language :: Python",
             "Programming Language :: Python :: 3",
-            "Programming Language :: Python :: 3.8",
             "Programming Language :: Python :: 3.9",
             "Programming Language :: Python :: 3.10",
             "Programming Language :: Python :: 3.11",
+            "Programming Language :: Python :: 3.12",
             "Programming Language :: Python :: Implementation :: CPython",
             "Topic :: Scientific/Engineering :: Mathematics",
             "Topic :: Scientific/Engineering :: Chemistry",
             "Topic :: Software Development :: Libraries :: Python Modules",
     ]
     dependencies = [
+        # IMPORTANT: idaes-pse should NOT be added to the default dependencies
+        # this causes, among other things, CI failures in IDAES/idaes-pse
         # Don't version setuptools, various bits complain
         "setuptools",
-        # For running tests
-        "pytest",
-        # dependency 'requests' module for standalone idaes-ui package
-        "requests"
+        "pydantic ~= 2.0",
+
+        # Pint 0.24.1 for Python 3.9 compatibility
+        "pint >= 0.24.1",
+
+        # fastapi is not used at the moment; uncomment once fastapi is needed again
+        # "fastapi",
+        # "uvicorn",
     ]
+
     keywords = ["IDAES", "energy systems", "chemical engineering", "process modeling"]
 
 [project.optional-dependencies]
-# Just for developers (they should also add 'jb')
-dev = [
-    # For adding copyright headers (see addheader.yml and the readme)
-    "addheader >= 0.3.0"
+testing = [
+    "pytest",
+    "pytest-icdiff >= 0.7",  # readable dict diffs for test_flowsheet and others
+    "playwright==1.42.0",
+    "pytest-playwright==0.4.4",
+    "requests==2.31.0",
+    # "httpx",  # fastapi testing
 ]
 # For packaging
 pkg = [
@@ -88,17 +97,18 @@ idaes_ui = [
     "*.dat",
     "*.yml",
     "*.yaml",
-    "fv/static/lib/**/*"
 ]
 
 [tool.pytest.ini_options]
 minversion = "6.0"
-addopts = "-ra"
+addopts = "-q"
 testpaths = [
-    "idaes_ui"
+    "idaes_ui",
+    "docs"
 ]
 markers = [
     "component: between unit and integration test",
     "unit: test one small unit of functionality",
-    "integration: test integrated functionality"
+    "integration: test integrated functionality",
+    "screenshot: screenshots"
 ]

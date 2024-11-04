@@ -19,6 +19,7 @@ The main class is `FlowsheetServer`, which is instantiated from the `visualize()
 # pylint: disable=missing-function-docstring
 
 # stdlib
+import io
 import http.server
 import json
 import logging
@@ -30,17 +31,23 @@ from typing import Dict, Union
 from urllib.parse import urlparse
 import time
 import os
+import traceback
 
 # package
 from idaes_ui.fv.flowsheet import FlowsheetDiff, FlowsheetSerializer
+from idaes_ui.fv.models import DiagnosticsData, DiagnosticsException, DiagnosticsError
+from idaes.core.util.model_diagnostics import DiagnosticsToolbox
 from . import persist, errors
 
 _log = logging.getLogger(__name__)
 
 # Directories
 _this_dir = Path(__file__).parent.absolute()
+# old web dir
+# this can be switch by add param ?app=old in url to enable old site
+# logic is in do_GET()
 _static_dir = _this_dir / "static"
-_template_dir = _this_dir / "templates"
+_template_dir = _this_dir / "static"
 
 
 class FlowsheetServer(http.server.HTTPServer):
@@ -55,6 +62,7 @@ class FlowsheetServer(http.server.HTTPServer):
 
     def __init__(self, port=None):
         """Create HTTP server"""
+        # port for dev remove it to allow system get random port in production
         self._port = port or find_free_port()
         _log.info(f"Starting HTTP server on localhost, port {self._port}")
         super().__init__(("127.0.0.1", self._port), FlowsheetServerHandler)
@@ -71,8 +79,6 @@ class FlowsheetServer(http.server.HTTPServer):
         """Start the server, which will spawn a thread."""
         self._thr = threading.Thread(target=self._run, daemon=True)
         self._thr.start()
-        #create shared JSON file
-        create_shared_JSON(self.port, "sample_visualization")
 
     def add_setting(self, key: str, value):
         """Add a setting to the flowsheet's settings block. Settings block is
@@ -101,7 +107,7 @@ class FlowsheetServer(http.server.HTTPServer):
         if key not in self._settings_block:
             _log.warning(f"key '{key}' is not set in the flowsheet settings block")
             return None
-        return self._settings_block[key]
+        return self._settings_block[key]  # {'save_time_interval': 5000}
 
     def add_flowsheet(self, id_, flowsheet, store: persist.DataStore) -> str:
         """Add a flowsheet, and also the method of saving it.
@@ -252,8 +258,15 @@ class FlowsheetServerHandler(http.server.SimpleHTTPRequestHandler):
         # Server should return text/javascript MIME type for served JS files (issue 259)
         self.extensions_map[".js"] = "text/javascript"
 
-    # === GET ===
+    # === OPTIONS ===
+    def do_OPTIONS(self):
+        self.send_response(200, "ok")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
 
+    # === GET ===
     def do_GET(self):
         """Process a request to receive data.
 
@@ -263,6 +276,8 @@ class FlowsheetServerHandler(http.server.SimpleHTTPRequestHandler):
           * `/setting`: Retrieve a setting value.
           * `/path/to/file`: Retrieve file stored static directory
         """
+
+        # Query url param
         u, queries = self._parse_flowsheet_url(self.path)
         id_ = queries.get("id", None) if queries else None
 
@@ -273,6 +288,7 @@ class FlowsheetServerHandler(http.server.SimpleHTTPRequestHandler):
             )
             return
 
+        # From path get what to do
         if u.path == "/app":
             self._get_app(id_)
         elif u.path == "/fs":
@@ -286,6 +302,8 @@ class FlowsheetServerHandler(http.server.SimpleHTTPRequestHandler):
                 )
                 return
             self._get_setting(setting_key_)
+        elif u.path == "/diagnostics":
+            self._get_diagnostics(id_)
         else:
             # Try to serve a file
             self.directory = _static_dir  # keep here: overwritten if set earlier
@@ -333,8 +351,25 @@ class FlowsheetServerHandler(http.server.SimpleHTTPRequestHandler):
         """
         self._write_json(200, {"setting_value": self.server.get_setting(setting_key_)})
 
-    # === PUT ===
+    def _get_diagnostics(self, id_):
+        fs = self.server._get_flowsheet_obj(id_)
+        diag_data = DiagnosticsData(fs)
+        diag_data_config = diag_data.config
+        diagnostics_toolbox_report = diag_data.diagnostics_toolbox_report
+        build_diagnostics_report = {
+            "config": diag_data_config,
+            "diagnostics_toolbox_report": {
+                "toolbox_jacobian_condition": diagnostics_toolbox_report.toolbox_jacobian_condition,
+                "toolbox_model_statistics": diagnostics_toolbox_report.toolbox_model_statistics,
+                "structural_report": diagnostics_toolbox_report.structural_report,
+                "numerical_report": diagnostics_toolbox_report.numerical_report,
+                "next_steps": diagnostics_toolbox_report.next_steps,
+            },
+        }
 
+        self._write_json(200, build_diagnostics_report)
+
+    # === PUT ===
     def do_PUT(self):
         """Process a request to store data."""
         u, queries = self._parse_flowsheet_url(self.path)
@@ -345,14 +380,18 @@ class FlowsheetServerHandler(http.server.SimpleHTTPRequestHandler):
                 400, message=f"Query parameter 'id' is required for '{u.path}'"
             )
             return
+
         if u.path == "/fs":
             self._put_fs(id_)
+        elif u.path == "/run_diagnostic":
+            self._put_diagnostic(id_)
 
     def _put_fs(self, id_):
-        # read  flowsheet from request (read(LENGTH) is required to avoid hanging)
+        # Read flowsheet from request (read(LENGTH) is required to avoid hanging)
         read_len = int(self.headers.get("Content-Length", "-1"))
         data = utf8_decode(self.rfile.read(read_len))
-        # save flowsheet
+
+        # Save flowsheet
         try:
             self.server.save_flowsheet(id_, data)
         except errors.ProcessingError as err:
@@ -361,14 +400,65 @@ class FlowsheetServerHandler(http.server.SimpleHTTPRequestHandler):
         except Exception as err:  # pylint: disable=W0703
             self._write_text(500, message=str(err))
             return
+
         self._write_text(200, message="success")
+
+    def _put_diagnostic(self, id_):
+        try:
+            # TODO: id_ in here is not from query param but from frontend, if id_ from do_PUT is None
+            # reading request json data
+            content_length = int(self.headers.get("Content-Length", 0))
+            request_body = self.rfile.read(content_length).decode("utf-8")
+            request_data = json.loads(request_body)
+
+            # get function name from request
+            function_name = request_data.get("function_name", "")
+            id_ = request_data.get("id", "")
+
+            # get fs
+            fs = self.server._get_flowsheet_obj(id_)
+
+            # create diagnosticToolbox instence
+            dt_instance = DiagnosticsToolbox(fs)
+
+            # base on pass in function name as function name and run diagnosticToolBox.function_name
+            if hasattr(dt_instance, function_name):
+                # read dt function from dt instance
+                current_function = getattr(dt_instance, function_name)
+                # initial streamIO use as stream to capture diagnostics output or its default will print to terminal
+                output_stream = io.StringIO()
+                # run current function
+                current_function(stream=output_stream)
+            else:
+                # return error function not exists
+                self._write_json(500, {"error": f"Unknown function: {function_name}"})
+
+            # read captured output content
+            captured_output = output_stream.getvalue()
+
+            # close StreamIO
+            output_stream.close()
+
+            # return respond
+            self._write_json(200, {"diagnostics_runner_result": captured_output})
+        except Exception as e:
+            traceback.print_exc()
+
+            # Return 500 status code and error message
+            self._write_json(
+                500,
+                {
+                    "error": f"Error running diagnostics: {str(e)}, please check your flowsheet!"
+                },
+            )
 
     # === Internal methods ===
 
     def _write_text(self, code, message: str):
         value = utf8_encode(message)
         self.send_response(code)
-        self.send_header("Content-type", "application/text")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-type", "text/plain")
         self.send_header("Content-length", str(len(value)))
         self.end_headers()
         self.wfile.write(value)
@@ -379,6 +469,7 @@ class FlowsheetServerHandler(http.server.SimpleHTTPRequestHandler):
             _log.debug(f"Sending JSON data:\n---begin---\n{str_json}\n---end---")
         value = utf8_encode(str_json)
         self.send_response(code)
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-type", "application/json")
         self.send_header("Content-length", str(len(value)))
         self.end_headers()
@@ -387,6 +478,7 @@ class FlowsheetServerHandler(http.server.SimpleHTTPRequestHandler):
     def _write_html(self, code, page):
         value = utf8_encode(page)
         self.send_response(code)
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-type", "text/html")
         self.send_header("Content-length", str(len(value)))
         self.end_headers()
@@ -394,8 +486,13 @@ class FlowsheetServerHandler(http.server.SimpleHTTPRequestHandler):
 
     def _parse_flowsheet_url(self, path):
         u, queries = urlparse(path), None
+        # u = ParseResult(scheme='', netloc='', path='/app', params='', query='id=sample_visualization', fragment='')
         if u.query:
-            queries = dict([q.split("=") for q in u.query.split("&")])
+            queries = {}
+            for item in u.query.split("&"):
+                parts = item.split("=")
+                if len(parts) == 2:  # skip if not name=value pair
+                    queries[parts[0]] = parts[1]
         return u, queries
 
     # === Logging ===
@@ -425,30 +522,3 @@ def find_free_port():
     s.close()
     time.sleep(1)  # wait for socket cleanup!!!
     return port
-
-def create_shared_JSON(current_port, flowsheet_name):
-    '''
-    Description:
-        This function is used to create a file shared_variable.json:
-        This file contain shared data between JS and Python code:
-        {"url" : "http://localhose:portNumber/app?id=flowsheetName"} etc.
-
-    Args:
-        the avilable port number generate by find_free_port()
-        the flowsheet name
-        
-    check shared_variable.json exists or not
-    1. if not exists, create one and write the port number
-    2. if does exist, update the port number
-    '''
-    localhost_url = 'http://localhost:' + str(current_port) + '/app?id=' + str(flowsheet_name)
-    
-    if not os.path.exists('shared_variable.json'):
-        with open('shared_variable.json', 'w') as f:
-            json.dump({"url" : localhost_url}, f)
-    else:
-        with open('shared_variable.json', 'r') as f:
-            data = json.load(f)
-            data["url"] = localhost_url
-        with open('shared_variable.json', 'w') as f:
-            json.dump(data, f)
