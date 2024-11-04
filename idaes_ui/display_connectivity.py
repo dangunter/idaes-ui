@@ -25,153 +25,104 @@ Run this script with the "-h/--help" option for help on usage.
 import argparse
 import csv
 from dataclasses import dataclass, field
+import enum
+import importlib
 from io import StringIO
+from pathlib import Path
+import pprint
 import sys
+from tempfile import TemporaryFile
+from typing import TextIO
+import warnings
 
-@dataclass
-class MermaidData:
-    units: list = field(default_factory=list)
-    streams: dict = field(default_factory=dict)
-    connections: list = field(default_factory=list)
-    show_streams: list = field(default_factory=list)
-    indent: str = "    "
+try:
+    import pyomo
+    from pyomo.environ import Block, value
+    from pyomo.network import Arc
+    from pyomo.network.port import Port
+except ImportError as err:
+    pyomo = None
+    warnings.warn(f"Could not import pyomo: {err}")    
 
-    def as_html(self, outfile):
-        outfile.write(
-            """<!doctype html>
-        <html lang="en">
-        <body>
-            <pre class="mermaid">\n"""
-        )
-        self._body(outfile)
-        outfile.write(
-            """
-            </pre>
-            <script type="module">
-            import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
-            mermaid.initialize({securityLevel: 'loose', maxEdges: 2000});
-            await mermaid.run();
-            </script>
-        </body>
-        </html>"""
-        )
+AS_STRING = "-"
 
-    def as_markdown(self, outfile):
-        outfile.write("# Graph\n```mermaid\n")
-        self._body(outfile)
-        outfile.write("\n```\n")
 
-    def as_mermaid(self, outfile):
-        self._body(outfile)
+class OutputFormats(enum.Enum):
+    markdown = "markdown"
+    html = "html"
+    mermaid = "mermaid"
+
+    @classmethod
+    def get_ext(cls, fmt):
+        match fmt:
+            case cls.html:
+                result = "html"
+            case cls.markdown:
+                result = "md"
+            case cls.mermaid:
+                result = "mmd"
+            case _:
+                raise ValueError("Bad format")
+        return result
+
+class Mermaid:
+    def __init__(self, connectivity, indent="   "):
+        self._conn = connectivity
+        self.indent = indent
+
+    def write(self, output_file: str | None, output_format: str = None):
+        if output_file is None:
+            f = StringIO()
+        else:
+            f = open(output_file, "w")
+        match output_format:
+            case OutputFormats.markdown.value:
+                f.write("# Graph\n```mermaid\n")
+                self._body(f)
+                f.write("\n```\n")
+            case OutputFormats.mermaid.value:
+                self._body(f)
+            case OutputFormats.html.value:
+                f.write("<!doctype html>\n<html lang='en'>\n<body>\n<pre class='mermaid'>\n")
+                self._body(f)
+                f.write("</pre>\n<script type='module'>\n")
+                f.write("import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';\n")
+                f.write("mermaid.initialize({securityLevel: 'loose', maxEdges: 2000});\n")
+                f.write("await mermaid.run();\n")
+                f.write("</script></body></html>")
+            case _:
+                raise ValueError(f"Bad output format: {output_format}")
+        if output_file is None:
+            return(f.getvalue())
 
     def _body(self, outfile):
         i = self.indent
         outfile.write("flowchart TD\n")
+        # Get connections first, so we know which streams to show
+        connections, show_streams = self._get_connections()
         # Units
-        for s in self.units:
+        for s in self._get_mermaid_units():
             outfile.write(f"{i}{s}\n")
         # Streams
-        for abbr, s in self.streams.items():
-            if abbr in self.show_streams:
+        for abbr, s in self._get_mermaid_streams():
+            if abbr in show_streams:
                 outfile.write(f"{i}{s}\n")
         # Connections
-        for s in self.connections:
+        for s in connections:
             outfile.write(f"{i}{s}\n")
 
-class Builder:
-    def __init__(self, input_file):
-        self._input_file = input_file
+    def _get_mermaid_units(self):
+        for name, abbr in self._conn.units.items():
+            yield f"{abbr}[{name}]"
 
-    def build(self):
-        pass
+    def _get_mermaid_streams(self):
+        for name, abbr in self._conn.streams.items():
+            yield abbr, f"{abbr}([{name}])"
 
-    def get_default_filename(self, ext) -> str:
-        pass
-    
-class ConnectivityFileBuilder(Builder):
-    """Build connectivity information from a file.
-    """
-    def __init__(self, input_file):
-        super().__init__(input_file)
-        datafile = open(input_file, "r")
-        reader = csv.reader(datafile)
-        self._header = next(reader)
-        self._rows = list(reader)
-        self._units = None
-        self._streams = None
-
-    def build(self) -> MermaidData:
-        mdata = MermaidData()
-        self._units, mdata.units = self._build_units()
-        self._streams, mdata.streams = self._build_streams()
-        mdata.connections, mdata.show_streams = self._build_connections(
-            self._build_connection_data()
-        )
-        return mdata
-
-    def get_default_filename(self, ext) -> str:
-        return self._change_ext(self._input_file, ext)
-
-    @staticmethod
-    def _change_ext(fname, ext):
-        i = fname.rfind(".")
-        if i > 0:
-            filename = fname[:i] + ext
-        else:
-            filename = fname + ext
-        return filename
-
-    def _build_units(self):
-        units = {}
-        mermaid_units = []
-        c1, c2 = 1, -1
-        for s in self._header[1:]:
-            abbr = "Unit_"
-            if c2 > -1:
-                abbr += chr(ord("A") + c2)
-            abbr += chr(ord("A") + c1)
-            mermaid_unit = f"{abbr}[{s}]"
-            units[s] = abbr
-            mermaid_units.append(mermaid_unit)
-            c1 += 1
-            if c1 == 26:
-                c1 = 0
-                c2 += 1
-        return units, mermaid_units
-
-    def _build_streams(self):
-        streams = {}
-        mermaid_streams = {}
-        n = 3
-        for row in self._rows[1:]:
-            s = row[0]
-            abbr = f"Stream_{n}"
-            mermaid_stream = f"{abbr}([{s}])"
-            streams[s] = abbr
-            mermaid_streams[abbr] = mermaid_stream
-            n += 1
-        return streams, mermaid_streams
-
-    def _build_connection_data(self):
-        connection_data = {s: [None, None] for s in self._streams.values()}
-        for row in self._rows[1:]:
-            stream_name = row[0]
-            col = 1
-            for conn in row[1:]:
-                if conn not in ("", "0"):
-                    conn = max(0, int(conn))  # -1 -> 0, 1 -> 1
-                    unit_name = self._header[col]
-                    unit_abbr = self._units[unit_name]
-                    stream_abbr = self._streams[stream_name]
-                    # print(f"{stream_name} {stream_abbr} : {conn}")
-                    connection_data[stream_abbr][conn] = unit_abbr
-                col += 1
-        return connection_data
-
-    def _build_connections(self, connection_data):
+    def _get_connections(self):
         connections = []
         show_streams = set()
-        for stream_abbr, values in connection_data.items():
+        for stream_abbr, values in self._conn.connections.items():
             if values[0] is not None and values[1] is not None:
                 connections.append(f"{values[0]} --> {values[1]}")
             elif values[0] is not None:
@@ -183,15 +134,152 @@ class ConnectivityFileBuilder(Builder):
         return connections, show_streams
 
 
-class ModelBuilder(Builder):
+@dataclass
+class Connectivity:
+    units: dict = field(default_factory=dict)
+    streams: dict = field(default_factory=dict)
+    connections: dict = field(default_factory=dict)
+
+class ConnectivityFile:
+    """Build connectivity information from a file.
+    """
+    def __init__(self, input_file: str | Path | TextIO):
+        if isinstance(input_file, str) or isinstance(input_file, Path):
+            datafile = open(input_file, "r")
+        else:
+            datafile = input_file
+        reader = csv.reader(datafile)
+        self._header = next(reader)
+        self._rows = list(reader)
+        self._c = None
+
+    @property
+    def connectivity(self):
+        if self._c is None:
+            units = self._build_units()
+            streams = self._build_streams()
+            connections = self._build_connections(units, streams)
+            self._c = Connectivity(units=units, streams=streams, connections=connections)
+        return self._c
+
+    def _build_units(self):
+        units = {}
+        c1, c2 = 1, -1
+        for s in self._header[1:]:
+            abbr = "Unit_"
+            if c2 > -1:
+                abbr += chr(ord("A") + c2)
+            abbr += chr(ord("A") + c1)
+            units[s] = abbr
+            c1 += 1
+            if c1 == 26:
+                c1 = 0
+                c2 += 1
+        return units
+
+    def _build_streams(self):
+        streams = {}
+        n = 3
+        for row in self._rows[1:]:
+            s = row[0]
+            abbr = f"Stream_{n}"
+            streams[s] = abbr
+            n += 1
+        return streams
+
+
+    def _build_connections(self, units, streams):
+        connections = {s: [None, None] for s in streams.values()}
+        for row in self._rows[1:]:
+            stream_name = row[0]
+            col = 1
+            for conn in row[1:]:
+                if conn not in ("", "0"):
+                    conn = max(0, int(conn))  # -1 -> 0, 1 -> 1
+                    try:
+                        unit_name = self._header[col]
+                    except IndexError:
+                        print(f"col={col} :: header-len={len(self._header)}")
+                        raise
+                    unit_abbr = units[unit_name]
+                    stream_abbr = streams[stream_name]
+                    connections[stream_abbr][conn] = unit_abbr
+                col += 1
+        return connections
+
+
+class ModelConnectivity:
     """Build connectivity information from a model.
     """
     def __init__(self, model):
-        self._model = model
+        if pyomo is None:
+            raise NotImplementedError("Trying to build from a Pyomo model, but Pyomo is not installed")
+        self._fs = model.fs
+        self._units = []
+        self._streams = []
+        self._build()
 
-    def build(self) -> MermaidData:
-        raise NotImplementedError("Building from a model is not yet supported")
-    
+
+    def _build(self):
+        fs = self._fs  # alias
+        units_ord, units_idx = {}, 0
+        streams_ord, streams_idx = {}, 0
+        rows, empty = [], True
+        for comp in fs.component_objects(Arc, descend_into=False):
+            stream_name = comp.getname()
+            src, dst = comp.source.parent_block(), comp.dest.parent_block()
+            src_name, dst_name = src.getname(), dst.getname()
+
+            src_i, dst_i, stream_i = -1, -1, -1
+
+            try:
+                idx = streams_ord[stream_name]
+            except KeyError:
+                self._streams.append(stream_name)
+                idx = streams_ord[stream_name] = streams_idx
+                streams_idx += 1
+                # if empty, there are no columns to lengthen; defer
+                if empty:
+                    rows = [[]]
+                    empty = False
+                else:
+                    rows.append([0] * len(rows[0]))
+            stream_i = idx
+ 
+            for unit_name, is_src in (src_name, True), (dst_name, False):
+                try:
+                    idx = units_ord[unit_name]
+                except KeyError:
+                    self._units.append(unit_name)
+                    idx = units_ord[unit_name] = units_idx
+                    units_idx += 1
+                    for row in rows:
+                        row.append(0)
+                if is_src:
+                    src_i = idx
+                else:
+                    dst_i = idx
+
+            rows[stream_i][src_i] = -1
+            rows[stream_i][dst_i] = 1
+
+        self._rows = rows
+        
+
+    def write(self, f: TextIO):
+        header = self._units.copy()
+        header.insert(0, "Units")
+        f.write(",".join(header))
+        f.write("\n")
+        header_sep = ["" for _ in self._units]
+        header_sep.insert(0, "Arcs")
+        f.write(",".join(header_sep))
+        f.write("\n")
+        for row_idx, row in enumerate(self._rows):
+            row.insert(0, self._streams[row_idx])
+            f.write(",".join((str(value) for value in row)))
+            f.write("\n")
+
     # def _identify_arcs(self):
     #     # Identify the arcs and known endpoints and store them
     #     for component in self.flowsheet.component_objects(Arc, descend_into=False):
@@ -238,59 +326,33 @@ class ModelBuilder(Builder):
 
     #     return components
 
-class MermaidOutput:
-    """Output a diagram in the format understood by MermaidJS
-    """
-    def __init__(self, builder: Builder):
-        self.mermaid = builder.build()
-        self._builder = builder
-
-    @staticmethod
-    def _as_string(fn) -> str:
-        sio = StringIO()
-        fn(sio)
-        return sio.getvalue()
-
-    def as_html(self, filename=None) -> None:
-        if filename is None:
-            filename = self._builder.get_default_filename(".html")
-        with open(filename, "w") as outfile:
-            self.mermaid.as_html(outfile)
-
-    def as_html_string(self) -> str:
-        return self._as_string(self.mermaid.as_html)
-
-    def as_markdown(self, filename=None) -> None:
-        if filename is None:
-            filename = self._builder.get_default_filename(".md")
-        with open(filename, "w") as outfile:
-            self.mermaid.as_markdown(outfile)
-
-    def as_markdown_string(self) -> str:
-        return self._as_string(self.mermaid.as_markdown)
-
-    def as_mermaid(self, filename=None) -> None:
-        if filename is None:
-            filename = self._builder.get_default_filename(".mmd")
-        with open(filename, "w") as outfile:
-            self.mermaid.as_mermaid(outfile)
-
-    def as_mermaid_string(self) -> str:
-        return self._as_string(self.mermaid.as_mermaid)
-
 
 def get_model(module_name):
-    return None
+    mod = importlib.import_module(module_name)
+    build_function = mod.build
+    model = build_function()
+    return model
     
+def get_default_filename(fname: str, ext: str) -> str:
+    i = fname.rfind(".")
+    if i > 0:
+        filename = fname[:i] + "." + ext
+    else:
+        filename = fname + + "." + ext
+    return filename
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--csv", help="Input CSV file", default=None)
     p.add_argument("-M", "--module", help="Input model's Python module", default=None)
     p.add_argument("--to", help="Packaging format for output mermaid graph",
-                   choices=("markdown", "mermaid", "html"), default="html")
+                   choices=("markdown", "mermaid", "html"), default="mermaid")
     p.add_argument(
-        "--ofile",
-        help="Output file (default=input with file extension changed)",
+        "-O"
+        "--output-file",
+        dest="ofile",
+        help=f"Output file (default=input with file extension changed, use '{AS_STRING}' to print)",
         default=None,
     )
     args = p.parse_args()
@@ -301,33 +363,39 @@ if __name__ == "__main__":
     elif all((args.csv, args.module)):
         p.error("Cannot specify more than one input method")
 
-    # Initialize builder
+    # Initialize
     if args.csv is not None:
-        builder = ConnectivityFileBuilder(args.csv)
+        conn_file = ConnectivityFile(args.csv)
     elif args.module is not None:
         try:
             model = get_model(args.module)
         except Exception as err:
             print("ERROR! Could not load model: {err}")
             sys.exit(1)
-        builder = ModelBuilder(model)
+        model_conn = ModelConnectivity(model)
+        with TemporaryFile(mode="w+t") as tempfile:
+            model_conn.write(tempfile)
+            tempfile.flush()  # make sure all data is written
+            tempfile.seek(0)  # reset to start of file for reading
+            conn_file = ConnectivityFile(tempfile)
     else:
         raise RuntimeError("No input method")
 
-    # Build connectivity information
+    # Build mermaid graph
     try:        
-        mermaid_out = builder.build()
+        mermaid = Mermaid(conn_file.connectivity)
     except Exception as err:
         print("ERROR! Could not parse connectivity information: {err}")
         print("Printing full stack trace below:")
         raise
 
     # Create output.
-    # Construct method name matching desired output format
-    # and call the method.
-    method_name = f"as_{args.to}"
-    if args.ofile == "-":
-        print(getattr(mermaid_out, method_name + "_string")())
+    if args.ofile == AS_STRING:
+        print(mermaid.write(None, output_format=args.to))
     else:
-        with open(args.ofile, "w") as output_file:
-            getattr(mermaid_out, method_name)(output_file)
+        if args.ofile is None:
+            ext = OutputFormats.get_ext(args.to)
+            output_file = get_default_filename(args.ofile, ext)
+        else:
+            output_file = args.ofile
+        mermaid.write(output_file, output_format=args.to)
