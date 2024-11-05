@@ -14,13 +14,9 @@ is either:
   *  1 meaning Arc(i) is an inlet for Unit(j),
   *  0 meaning there is no connection
 
-The output will be a minimal HTML page that uses the Mermaid JavaScript library
-to render a graph of the connectivity.
 
-If the "--md" option is given the output will instead be a Markdown file
-that has embedded Mermaid, which can be rendered natively by GitHub.
-
-Run this script with the "-h/--help" option for help on usage.
+This module can be run as a script or used programmatically, using the
+public functions `create_from_matrix` and `create_from_model`.
 """
 import argparse
 import csv
@@ -32,6 +28,7 @@ from pathlib import Path
 import pprint
 import sys
 from tempfile import TemporaryFile
+from traceback import format_stack
 from typing import TextIO
 import warnings
 
@@ -44,13 +41,25 @@ except ImportError as err:
     pyomo = None
     warnings.warn(f"Could not import pyomo: {err}")    
 
+# For logging
+from idaes_ui.yoder import add_log_options, process_log_options
+
+# Constants
 AS_STRING = "-"
 
+# Logging
+_log = None
+
+
+##############
+# Classes
+##############
 
 class OutputFormats(enum.Enum):
     markdown = "markdown"
     html = "html"
     mermaid = "mermaid"
+    csv = "csv"
 
     @classmethod
     def get_ext(cls, fmt):
@@ -140,8 +149,8 @@ class Connectivity:
     streams: dict = field(default_factory=dict)
     connections: dict = field(default_factory=dict)
 
-class ConnectivityFile:
-    """Build connectivity information from a file.
+class ConnectivityFromFile:
+    """Build connectivity information from input data.
     """
     def __init__(self, input_file: str | Path | TextIO):
         if isinstance(input_file, str) or isinstance(input_file, Path):
@@ -280,60 +289,21 @@ class ModelConnectivity:
             f.write(",".join((str(value) for value in row)))
             f.write("\n")
 
-    # def _identify_arcs(self):
-    #     # Identify the arcs and known endpoints and store them
-    #     for component in self.flowsheet.component_objects(Arc, descend_into=False):
-    #         self.streams[component.getname()] = component
-    #         self._known_endpoints.add(component.source.parent_block())
-    #         self._known_endpoints.add(component.dest.parent_block())
-    #         self._ordered_stream_names.append(component.getname())
+############
+# Utility
+############
 
-    # def _identify_unit_models(self) -> dict:
-    #     # pylint: disable=import-outside-toplevel
-    #     from idaes.core import UnitModelBlockData  # avoid circular import
-    #     from idaes.core.base.property_base import PhysicalParameterBlock, StateBlock
-
-    #     # Create a map of components to their unit type
-    #     components = {}
-
-    #     # Identify the unit models and ports and store them
-    #     for component in self.flowsheet.component_objects(Block, descend_into=True):
-    #         if isinstance(component, UnitModelBlockData):
-    #             # List of components is the same as the provided one
-    #             components[component] = self.get_unit_model_type(component)
-    #         elif isinstance(component, PhysicalParameterBlock) or isinstance(
-    #             component, StateBlock
-    #         ):
-    #             # skip physical parameter / state blocks
-    #             pass
-    #         else:
-    #             # Find unit models nested within indexed blocks
-    #             type_ = self.get_unit_model_type(component)
-    #             for item in component.parent_component().values():
-    #                 if isinstance(item, UnitModelBlockData):
-    #                     # See if this unit is connected to an arc
-    #                     is_connected = False
-    #                     for stream in self.streams.values():
-    #                         if (
-    #                             item == stream.source.parent_block()
-    #                             or item == stream.dest.parent_block()
-    #                         ):
-    #                             is_connected = True
-    #                             break
-    #                     # Add to diagram if connected
-    #                     if is_connected:
-    #                         components[item] = type_
-
-    #     return components
-
-
-def get_model(module_name):
+def _get_model(module_name):
+    _log.info("[begin] load and build model")
     mod = importlib.import_module(module_name)
     build_function = mod.build
+    _log.debug("[begin] build model")
     model = build_function()
+    _log.debug("[ end ] build model")
+    _log.info("[ end ] load and build model")
     return model
     
-def get_default_filename(fname: str, ext: str) -> str:
+def _get_default_filename(fname: str, ext: str) -> str:
     i = fname.rfind(".")
     if i > 0:
         filename = fname[:i] + "." + ext
@@ -341,61 +311,179 @@ def get_default_filename(fname: str, ext: str) -> str:
         filename = fname + + "." + ext
     return filename
 
+def _real_output_file(file_, to_, input_file=None):
+        if file_ is None:
+            if input_file is None:
+                return None
+            ext = OutputFormats.get_ext(to_)
+            output_file = _get_default_filename(file_, ext)
+            print(f"No output file specified, using '{output_file}'")
+        else:
+            output_file = file_
+        return output_file
 
-if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--csv", help="Input CSV file", default=None)
-    p.add_argument("-M", "--module", help="Input model's Python module", default=None)
-    p.add_argument("--to", help="Packaging format for output mermaid graph",
-                   choices=("markdown", "mermaid", "html"), default="mermaid")
-    p.add_argument(
-        "-O"
-        "--output-file",
-        dest="ofile",
-        help=f"Output file (default=input with file extension changed, use '{AS_STRING}' to print)",
-        default=None,
-    )
-    args = p.parse_args()
+##################
+# Public interface
+##################
 
-    # Sanity-check args
-    if args.csv is None and args.module is None:
-        p.error("Must specify one of --csv or -M/--module as input")
-    elif all((args.csv, args.module)):
-        p.error("Cannot specify more than one input method")
+def create_from_matrix(ifile: str, ofile: str | None, to_format: str) -> Connectivity | None:
+    """Programmatic interface to create a graph of the model from a connectivity matrix.
 
-    # Initialize
-    if args.csv is not None:
-        conn_file = ConnectivityFile(args.csv)
-    elif args.module is not None:
-        try:
-            model = get_model(args.module)
-        except Exception as err:
-            print("ERROR! Could not load model: {err}")
-            sys.exit(1)
-        model_conn = ModelConnectivity(model)
-        with TemporaryFile(mode="w+t") as tempfile:
-            model_conn.write(tempfile)
-            tempfile.flush()  # make sure all data is written
-            tempfile.seek(0)  # reset to start of file for reading
-            conn_file = ConnectivityFile(tempfile)
-    else:
-        raise RuntimeError("No input method")
+    Args:
+        ifile (str): Input filename
+        ofile: Output file name. If this is the special value defined by `AS_STRING`, then
+               The output will go to the console. If None, then no output will
+               be created and the connectivity will be returned as an object.
+        to_format: Output format, which should match one of the values in `OutputFormat`
 
-    # Build mermaid graph
-    try:        
+    Raises:
+        RuntimeError: For all errors captured during Mermaid processing
+    """
+    conn_file = ConnectivityFromFile(ifile)
+
+    if ofile is None:
+        return conn_file.connectivity
+
+    try:
         mermaid = Mermaid(conn_file.connectivity)
     except Exception as err:
-        print("ERROR! Could not parse connectivity information: {err}")
-        print("Printing full stack trace below:")
-        raise
-
-    # Create output.
+        err_msg = f"Could not parse connectivity information: {err}. "
+        err_msg += f"Stack trace:\n{format_stack()}"
+        raise RuntimeError(err_msg)
+    
     if args.ofile == AS_STRING:
         print(mermaid.write(None, output_format=args.to))
     else:
-        if args.ofile is None:
-            ext = OutputFormats.get_ext(args.to)
-            output_file = get_default_filename(args.ofile, ext)
-        else:
-            output_file = args.ofile
+        output_file = _real_output_file(args.ofile, args.to, input_file=args.input_file)
         mermaid.write(output_file, output_format=args.to)
+
+
+    
+def create_from_model(module_name: str, ofile: str, to_format: str) -> Connectivity | None:
+    """Programmatic interface to create the connectivity or mermaid output from a python model.
+
+    Arguments:
+        module_name: Dotted Python module name (absolute, e.g. package.subpackage.module).
+                     The protocol is to call the `build()` function in the module to get
+                     back a model.
+        ofile: Output file name. If this is the special value defined by `AS_STRING`, then
+               The output will go to the console. If None, then no output will
+               be created and the connectivity will be returned as an object.
+        to_format: Output format, which should match one of the values in `OutputFormat`
+
+    Returns:
+        Connectivity instance, if ofile is None
+
+    Raises:
+        RuntimeError: For all errors captured while building the model
+    """
+    try:
+        model = _get_model(module_name)
+    except Exception as err:
+        raise RuntimeError(f"Could not load model: {err}")
+
+    model_conn = ModelConnectivity(model)
+    
+    output_file = _real_output_file(ofile, to_format)
+    conn_file = None
+    with TemporaryFile(mode="w+t") as tempfile:
+        model_conn.write(tempfile)
+        tempfile.flush()  # make sure all data is written
+        tempfile.seek(0)  # reset to start of file for reading
+        # if no output, just parse the file and return the result
+        if ofile is None:
+            conn_file = ConnectivityFromFile(tempfile)
+            return conn_file.connectivity
+        # for CSV, just copy the temporary file
+        elif to_format == "csv":
+            tempfile.seek(0)
+            if ofile == AS_STRING:
+                for line in tempfile:
+                    print(line, end="")
+            else:
+                with open(output_file, "w") as ofile:
+                    for line in tempfile:
+                        ofile.write(line)
+        # for Mermaid, etc., process the temporary file
+        else:
+            conn_file = ConnectivityFromFile(tempfile)
+            mermaid = Mermaid(conn_file.connectivity)
+            if output_file == AS_STRING:
+                print(mermaid.write(None, output_format=to_format))
+            else:
+                mermaid.write(output_file, output_format=to_format)
+
+##############
+# Command-line
+##############
+
+def csv_main(args) -> int:
+    """CLI function for creating a graph from connectivity matrix specifying units and streams.
+
+    Args:
+        args: Parsed args from ArgumentParser
+
+    Returns:
+        int: Code for sys.exit()
+    """
+    _log.info("[begin] create from matrix")
+    try:
+        create_from_matrix(args.input_file, args.ofile, args.to)
+    except Exception as err:
+        _log.info("[ end ] create from matrix (1)")
+        _log.error("{err}")
+        return 1
+    _log.info("[ end ] create from matrix")
+
+    return 0
+
+def module_main(args) -> int:
+    """CLI function for creating connectivity/graph from a Python model.
+
+    Args:
+        args: Parsed args from ArgumentParser
+
+    Returns:
+        int: Code for sys.exit()
+    """
+    _log.info("[begin] create from Python model")
+    try:
+        create_from_model(module_name=args.module_name, ofile=args.ofile, to_format=args.to)
+    except RuntimeError as err:
+        _log.info("[ end ] create from Python model (1)")
+        _log.error("{err}")
+        return 1
+    _log.info("[ end ] create from Python model")
+
+if __name__ == "__main__":
+    p_top = argparse.ArgumentParser()
+    add_log_options(p_top)
+    subp = p_top.add_subparsers()
+    p = subp.add_parser("csv", help="Read from a CSV file and generate a graph")
+    p.add_argument("input_file", help="Input CSV file")
+    p.add_argument(
+        "-O",
+        "--output-file",
+        dest="ofile",
+        help=f"Output file",
+        default=AS_STRING,
+    )
+    p.add_argument("--to", help="Output format for mermaid graph (default=mermaid)",
+                   choices=("markdown", "mermaid", "html"), default="mermaid")
+    p.set_defaults(main_method=csv_main)
+    p = subp.add_parser("module", help="Read from a Python model and generate a CSV file or a graph")
+    p.add_argument(
+        "-O",
+        "--output-file",
+        dest="ofile",
+        help=f"Output file",
+        default=AS_STRING,
+    )
+    p.add_argument("module_name", help="A dotted Python module name")
+    p.add_argument("--to", help="Output format for CSV or mermaid graph (default=csv)",
+                   choices=("csv", "markdown", "mermaid", "html"), default="csv")
+    p.set_defaults(main_method=module_main)
+    args = p_top.parse_args()
+    _log = process_log_options("idaes_ui.display_connectivity", args)
+
+    sys.exit(args.main_method(args))
